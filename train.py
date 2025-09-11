@@ -14,6 +14,16 @@ import timm
 from tqdm import tqdm
 
 
+def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float):
+    """Apply MixUp augmentation."""
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
 class FocalLoss(nn.Module):
     """Focal Loss for tackling class imbalance"""
 
@@ -98,6 +108,8 @@ if __name__ == '__main__':
                         help='amount of label smoothing for cross entropy')
     parser.add_argument('--log-dir', type=str, default='runs',
                         help='directory for TensorBoard logs')
+    parser.add_argument('--mixup-alpha', type=float, default=0.0,
+                        help='alpha value for MixUp augmentation (0 to disable)')
     args = parser.parse_args()
 
     writer = SummaryWriter(log_dir=args.log_dir) if SummaryWriter else None
@@ -131,7 +143,7 @@ if __name__ == '__main__':
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        total_correct = 0
+        total_correct = 0.0
         total_samples = 0
 
         # 使用 tqdm 显示训练进度
@@ -141,27 +153,38 @@ if __name__ == '__main__':
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            if args.mixup_alpha > 0.0:
+                images, targets_a, targets_b, lam = mixup_data(images, labels, args.mixup_alpha)
+                outputs = model(images)
+                loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
+                _, preds = torch.max(outputs, 1)
+                total_correct += (
+                    lam * (preds == targets_a).float().sum().item()
+                    + (1 - lam) * (preds == targets_b).float().sum().item()
+                )
+            else:
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                _, preds = torch.max(outputs, 1)
+                total_correct += torch.sum(preds == labels.data).item()
+
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item() * images.size(0)
-            _, preds = torch.max(outputs, 1)
-            total_correct += torch.sum(preds == labels.data)
             total_samples += images.size(0)
 
             # 更新进度条显示当前的批次loss
             progress_bar.set_postfix(loss=f"{loss.item():.4f}")
 
         epoch_loss = running_loss / total_samples
-        epoch_acc = total_correct.double() / total_samples
+        epoch_acc = total_correct / total_samples
         print(f'Epoch {epoch+1}/{num_epochs} - Train Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}')
 
         # 验证过程
         model.eval()
         val_loss = 0.0
-        val_correct = 0
+        val_correct = 0.0
         val_samples = 0
         with torch.no_grad():
             progress_bar_val = tqdm(val_loader, desc=f"Validation Epoch {epoch+1}", leave=False)
@@ -172,12 +195,12 @@ if __name__ == '__main__':
                 loss = criterion(outputs, labels)
                 val_loss += loss.item() * images.size(0)
                 _, preds = torch.max(outputs, 1)
-                val_correct += torch.sum(preds == labels.data)
+                val_correct += torch.sum(preds == labels.data).item()
                 val_samples += images.size(0)
                 progress_bar_val.set_postfix(loss=f"{loss.item():.4f}")
         
         val_loss /= val_samples
-        val_acc = val_correct.double() / val_samples
+        val_acc = val_correct / val_samples
         print(f'Validation - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}')
 
         if writer:
