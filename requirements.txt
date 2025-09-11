@@ -4,3 +4,4 @@ timm
 pillow
 PyYAML
 tensorboard
+numpy

@@ -12,6 +12,7 @@ except ImportError:
 from PIL import Image
 import timm
 from tqdm import tqdm
+import numpy as np
 
 
 def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float):
@@ -22,6 +23,35 @@ def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float):
     mixed_x = lam * x + (1 - lam) * x[index, :]
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
+
+
+def rand_bbox(size, lam):
+    W = size[3]
+    H = size[2]
+    cut_rat = np.sqrt(1.0 - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    return bbx1, bby1, bbx2, bby2
+
+
+def cutmix_data(x: torch.Tensor, y: torch.Tensor, alpha: float):
+    """Apply CutMix augmentation."""
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+    x[:, :, bby1:bby2, bbx1:bbx2] = x[index, :, bby1:bby2, bbx1:bbx2]
+    y_a, y_b = y, y[index]
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size(2) * x.size(3)))
+    return x, y_a, y_b, lam
 
 
 class FocalLoss(nn.Module):
@@ -110,9 +140,14 @@ if __name__ == '__main__':
                         help='directory for TensorBoard logs')
     parser.add_argument('--mixup-alpha', type=float, default=0.0,
                         help='alpha value for MixUp augmentation (0 to disable)')
+    parser.add_argument('--cutmix-alpha', type=float, default=0.0,
+                        help='alpha value for CutMix augmentation (0 to disable)')
     args = parser.parse_args()
 
     writer = SummaryWriter(log_dir=args.log_dir) if SummaryWriter else None
+
+    if args.mixup_alpha > 0.0 and args.cutmix_alpha > 0.0:
+        raise ValueError('MixUp and CutMix cannot be used together')
 
     # 加载数据集
     train_dataset = FERDataset(data_dir='./Training', transform=transform)
@@ -155,6 +190,15 @@ if __name__ == '__main__':
             optimizer.zero_grad()
             if args.mixup_alpha > 0.0:
                 images, targets_a, targets_b, lam = mixup_data(images, labels, args.mixup_alpha)
+                outputs = model(images)
+                loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
+                _, preds = torch.max(outputs, 1)
+                total_correct += (
+                    lam * (preds == targets_a).float().sum().item()
+                    + (1 - lam) * (preds == targets_b).float().sum().item()
+                )
+            elif args.cutmix_alpha > 0.0:
+                images, targets_a, targets_b, lam = cutmix_data(images, labels, args.cutmix_alpha)
                 outputs = model(images)
                 loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
                 _, preds = torch.max(outputs, 1)
