@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
@@ -142,6 +142,8 @@ if __name__ == '__main__':
                         help='alpha value for MixUp augmentation (0 to disable)')
     parser.add_argument('--cutmix-alpha', type=float, default=0.0,
                         help='alpha value for CutMix augmentation (0 to disable)')
+    parser.add_argument('--balance-sampler', action='store_true',
+                        help='use class-balanced sampler for training data')
     args = parser.parse_args()
 
     writer = SummaryWriter(log_dir=args.log_dir) if SummaryWriter else None
@@ -152,19 +154,26 @@ if __name__ == '__main__':
     # 加载数据集
     train_dataset = FERDataset(data_dir='./Training', transform=transform)
     val_dataset = FERDataset(data_dir='./PublicTest', transform=transform)
+    num_classes = 7
+    class_weights = compute_class_weights(train_dataset, num_classes)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    if args.balance_sampler:
+        sample_weights = [class_weights[label].item() for _, label in train_dataset.samples]
+        sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # 加载模型
-    num_classes = 7
     model = timm.create_model('vit_base_patch16_224', pretrained=args.pretrained)
     model.head = nn.Linear(model.head.in_features, num_classes)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    class_weights = compute_class_weights(train_dataset, num_classes).to(device)
+    class_weights = class_weights.to(device)
 
     if args.use_focal_loss:
         criterion = FocalLoss(alpha=class_weights)
